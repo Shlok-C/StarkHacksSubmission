@@ -1,0 +1,9 @@
+The robot has 3 axis.
+
+The first axis is at the base of the robot. this is a stepper motor running a gear ratio to rotate the entire base of the robot. this simplifies the math later when doing inverse kinematics.
+Above this motor, there is a odrive bldc motor that is extremely powerful, and is running a worm gear to a normal spur gear to act as the shoulder of the arm. this rotates the arm about the origin, which is rotated by the base motor.
+The configuration of the worm and spur gear is simple. the worm gear is horizontal with the motor shaft sticking into it from the side of the robot casing. then the spur gear is directly ontop of the worm gear which will rotate in a axis orthogonal to the worm gear.
+the first arm (lower arm) is attached to the spur gear directly, forcing it to move with it. Also, mounted on the lower arm, there is a stepper motor which is mounted to the bottom of the arm with a small pivot joint.
+This way the motor can sorta move about an axis. It needs to do this because its shaft is a long lead screw which goes to the top of the lower arm to the elbow joint.
+at the elbo, there is a lead nut which is mounted to an overhang of the upper arm part. this way the degree of the upper arm can be controlled by the stepper on the pivot which is connected to the elbow via the lead screw.
+This gives a 3 axis robot arm that can move in a 3d space, while simplifying the inverse kinematics by solving the 2d kinematics then changing the angle from the base motor in that radius.
