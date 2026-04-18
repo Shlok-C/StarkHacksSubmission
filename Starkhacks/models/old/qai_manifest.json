@@ -1,0 +1,14 @@
+{
+  "palm_detection": {
+    "path": "models/PalmDetector_qai.bin",
+    "format": "qnn"
+  },
+  "hand_landmark": {
+    "path": "models/HandLandmarkDetector_qai.bin",
+    "format": "qnn"
+  },
+  "gesture_classifier": {
+    "path": "models/GestureClassifier_qai.bin",
+    "format": "qnn"
+  }
+}
