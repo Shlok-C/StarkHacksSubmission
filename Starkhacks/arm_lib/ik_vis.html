@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Robot Arm IK Visualizer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#060a10;--surface:#0d1520;--border:#1a2d44;
+  --cyan:#00d4ff;--orange:#ff5500;--text:#6a8aaa;--bright:#a0c4e0;
+  --green:#00e888;--red:#ff3344;
+}
+body{background:var(--bg);color:var(--text);font-family:'Courier New',monospace;display:flex;height:100vh;overflow:hidden}
+#sidebar{width:236px;min-width:236px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto}
+.logo{padding:14px 16px;border-bottom:1px solid var(--border)}
+.logo-title{font-size:12px;letter-spacing:3px;color:var(--cyan);font-weight:bold}
+.logo-sub{font-size:10px;color:var(--text);margin-top:3px;letter-spacing:1px}
+.sec{padding:12px 16px;border-bottom:1px solid var(--border)}
+.sec-title{font-size:9px;letter-spacing:2px;color:var(--cyan);margin-bottom:10px;font-weight:bold;opacity:.8}
+.row{display:flex;justify-content:space-between;align-items:center;margin:5px 0;font-size:11px}
+.val{color:var(--bright);font-weight:bold}
+.bar{height:2px;background:#0d1d30;margin:4px 0 8px;border-radius:1px;overflow:hidden}
+.fill{height:100%;background:var(--cyan);border-radius:1px;transition:width .04s;min-width:2px}
+.ok{color:var(--green);font-weight:bold;font-size:11px}
+.err{color:var(--red);font-weight:bold;font-size:11px}
+input[type=range]{width:100%;accent-color:var(--cyan);margin:5px 0 0;cursor:pointer}
+#wrap{flex:1;position:relative;overflow:hidden;cursor:crosshair}
+canvas{display:block;width:100%;height:100%}
+.hint{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);
+  background:rgba(6,10,16,.88);border:1px solid var(--border);
+  padding:7px 18px;font-size:10px;color:var(--text);letter-spacing:1.5px;
+  pointer-events:none;white-space:nowrap}
+.tag{position:absolute;top:14px;right:14px;font-size:9px;letter-spacing:2px;color:var(--border)}
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div class="logo">
+    <div class="logo-title">IK VISUALIZER</div>
+    <div class="logo-sub">STARKHACKS 2026 · 3-AXIS ARM</div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">ARM DIMENSIONS</div>
+    <div class="row"><span>L1 lower arm</span><span class="val">345.7 mm</span></div>
+    <div class="row"><span>L2 upper arm</span><span class="val">282.7 mm</span></div>
+    <div class="row"><span>L3 end effector</span><span class="val">101.6 mm</span></div>
+    <div class="row" style="margin-top:6px"><span>max reach</span><span class="val" id="d-reach">—</span></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">JOINT ANGLES</div>
+    <div class="row"><span>θ base</span><span class="val" id="a-base">0.0°</span></div>
+    <div class="bar"><div class="fill" id="f-base" style="width:50%"></div></div>
+    <div class="row"><span>θ shoulder</span><span class="val" id="a-sho">0.0°</span></div>
+    <div class="bar"><div class="fill" id="f-sho" style="width:30%"></div></div>
+    <div class="row"><span>θ elbow</span><span class="val" id="a-elb">0.0°</span></div>
+    <div class="bar"><div class="fill" id="f-elb" style="width:60%"></div></div>
+    <div class="row"><span>θ wrist (motor)</span><span class="val" id="a-wri">0.0°</span></div>
+    <div class="bar"><div class="fill" id="f-wri" style="width:40%"></div></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">TARGET POSITION</div>
+    <div class="row"><span>X (forward)</span><span class="val" id="t-x">—</span></div>
+    <div class="row"><span>Y (side)</span><span class="val" id="t-y">—</span></div>
+    <div class="row"><span>Z (height vs shoulder)</span><span class="val" id="t-z">—</span></div>
+    <div class="row" style="margin-top:6px"><span>STATUS</span><span id="t-status" class="ok">NO TARGET</span></div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-title">HOVER HEIGHT ABOVE TABLE</div>
+    <div class="row"><span>Z_HOVER</span><span class="val" id="h-val">304.8 mm</span></div>
+    <input type="range" id="h-slider" min="102" max="580" value="305" step="1">
+  </div>
+
+  <div class="sec" style="flex:1">
+    <div class="sec-title">CONTROLS</div>
+    <div class="row"><span>Click workspace</span></div>
+    <div style="font-size:10px;color:#334455;margin:-2px 0 6px 8px">→ move arm to target</div>
+    <div class="row"><span>Drag</span></div>
+    <div style="font-size:10px;color:#334455;margin:-2px 0 6px 8px">→ orbit camera</div>
+    <div class="row"><span>Scroll</span></div>
+    <div style="font-size:10px;color:#334455;margin:-2px 0 6px 8px">→ zoom</div>
+  </div>
+</div>
+
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div class="hint">CLICK ON THE GRID TO SET ARM TARGET</div>
+  <div class="tag">THREE.JS r128</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ── IK CONSTANTS (mirrors ik_solver.py) ──────────────────────────────────────
+const L1 = 13.612 * 25.4;   // 345.7 mm
+const L2 = 11.130 * 25.4;   // 282.7 mm
+const L3 = 4.0   * 25.4;    // 101.6 mm
+const SHOULDER_X = 0;
+const SHOULDER_Y = 0;
+const SHOULDER_HEIGHT = 300; // mm above table (adjust to your build)
+const TABLE_Y = -SHOULDER_HEIGHT;
+
+// ── IK SOLVER ────────────────────────────────────────────────────────────────
+function solveIK(x_raw, y_raw, z) {
+  const x = x_raw - SHOULDER_X;
+  const y = y_raw - SHOULDER_Y;
+  const r       = Math.sqrt(x*x + y*y);
+  const r_wrist = r - L3;
+  if (r_wrist < 0) return null;
+  const D = Math.sqrt(r_wrist*r_wrist + z*z);
+  if (D > L1 + L2)           return null;
+  if (D < Math.abs(L1 - L2)) return null;
+  const theta_base = Math.atan2(y, x);
+  const ce = Math.max(-1, Math.min(1, (L1*L1 + L2*L2 - D*D) / (2*L1*L2)));
+  const theta_elbow = Math.acos(ce);
+  const beta  = Math.atan2(z, r_wrist);
+  const ca    = Math.max(-1, Math.min(1, (L1*L1 + D*D - L2*L2) / (2*L1*D)));
+  const alpha = Math.acos(ca);
+  const theta_shoulder = alpha + beta;
+  const wrist_motor_deg = -(theta_shoulder + theta_elbow) * 180/Math.PI;
+  return { base: theta_base, shoulder: theta_shoulder, elbow: theta_elbow, wrist_motor_deg };
+}
+
+// ── THREE.JS SETUP ───────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x060a10);
+scene.fog = new THREE.Fog(0x060a10, 3500, 7000);
+
+const camera = new THREE.PerspectiveCamera(42, 1, 1, 10000);
+
+// ── LIGHTING ─────────────────────────────────────────────────────────────────
+scene.add(new THREE.AmbientLight(0x1a2d44, 2.5));
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+sun.position.set(600, 900, 500);
+sun.castShadow = true;
+scene.add(sun);
+const cyanPt = new THREE.PointLight(0x00d4ff, 1.0, 1000);
+scene.add(cyanPt);
+
+// ── MATERIALS ────────────────────────────────────────────────────────────────
+const M_arm    = new THREE.MeshPhongMaterial({ color:0x00b8e0, emissive:0x001a24, shininess:90 });
+const M_joint  = new THREE.MeshPhongMaterial({ color:0x007799, emissive:0x001122, shininess:120 });
+const M_ee     = new THREE.MeshPhongMaterial({ color:0xff5500, emissive:0x331100, shininess:60 });
+const M_tip    = new THREE.MeshPhongMaterial({ color:0xff8800, emissive:0x441800 });
+const M_base   = new THREE.MeshPhongMaterial({ color:0x182638, emissive:0x060d18 });
+const M_target = new THREE.MeshPhongMaterial({ color:0xff4400, emissive:0x551100, transparent:true, opacity:.85 });
+const M_tring  = new THREE.MeshBasicMaterial({ color:0xff5500, side:THREE.DoubleSide, transparent:true, opacity:.5 });
+
+// ── WORKSPACE ────────────────────────────────────────────────────────────────
+const grid = new THREE.GridHelper(1600, 32, 0x0c2035, 0x0c2035);
+grid.position.y = TABLE_Y;
+scene.add(grid);
+
+const tableM = new THREE.Mesh(
+  new THREE.PlaneGeometry(1600, 1600),
+  new THREE.MeshPhongMaterial({ color:0x08101c, transparent:true, opacity:.7, side:THREE.DoubleSide })
+);
+tableM.rotation.x = -Math.PI/2;
+tableM.position.y = TABLE_Y - 1;
+tableM.receiveShadow = true;
+scene.add(tableM);
+
+// Reachable zone ring on table
+const maxRwrist = Math.sqrt(Math.max(0, (L1+L2)*(L1+L2) - SHOULDER_HEIGHT*SHOULDER_HEIGHT));
+const maxR = maxRwrist + L3;
+document.getElementById('d-reach').textContent = maxR.toFixed(0) + ' mm';
+if (maxR > 0) {
+  const rg = new THREE.RingGeometry(maxR-3, maxR+3, 80);
+  const rm = new THREE.MeshBasicMaterial({ color:0x003344, side:THREE.DoubleSide, transparent:true, opacity:.5 });
+  const ring = new THREE.Mesh(rg, rm);
+  ring.rotation.x = -Math.PI/2;
+  ring.position.y = TABLE_Y + 1;
+  scene.add(ring);
+}
+
+// Vertical axis post
+const post = new THREE.Mesh(new THREE.CylinderGeometry(5,5,SHOULDER_HEIGHT,12), M_base);
+post.position.y = TABLE_Y + SHOULDER_HEIGHT/2;
+scene.add(post);
+
+// ── ARM HIERARCHY ────────────────────────────────────────────────────────────
+// baseGroup → rotates Y (θ_base)
+//   shoulderGroup → rotates Z (θ_shoulder)
+//     link1 (L1)
+//     elbowGroup → rotates Z (elbow bend)
+//       link2 (L2)
+//       wristGroup → rotates Z (keeps L3 level)
+//         link3 (L3, end effector)
+
+const baseGroup     = new THREE.Group();
+const shoulderGroup = new THREE.Group();
+const elbowGroup    = new THREE.Group();
+const wristGroup    = new THREE.Group();
+
+scene.add(baseGroup);
+baseGroup.add(shoulderGroup);
+
+// Shoulder joint sphere
+shoulderGroup.add(new THREE.Mesh(new THREE.SphereGeometry(18, 24, 24), M_joint));
+
+// Lower arm (L1)
+const link1 = new THREE.Mesh(new THREE.BoxGeometry(L1, 22, 22), M_arm);
+link1.position.x = L1/2;
+link1.castShadow = true;
+shoulderGroup.add(link1);
+
+// Elbow at end of L1
+elbowGroup.position.x = L1;
+shoulderGroup.add(elbowGroup);
+elbowGroup.add(new THREE.Mesh(new THREE.SphereGeometry(14, 20, 20), M_joint));
+
+// Upper arm (L2)
+const link2 = new THREE.Mesh(new THREE.BoxGeometry(L2, 17, 17), M_arm);
+link2.position.x = L2/2;
+link2.castShadow = true;
+elbowGroup.add(link2);
+
+// Wrist at end of L2
+wristGroup.position.x = L2;
+elbowGroup.add(wristGroup);
+wristGroup.add(new THREE.Mesh(new THREE.SphereGeometry(10, 16, 16), M_joint));
+
+// End effector (L3)
+const link3 = new THREE.Mesh(new THREE.BoxGeometry(L3, 12, 12), M_ee);
+link3.position.x = L3/2;
+link3.castShadow = true;
+wristGroup.add(link3);
+
+// Tool tip
+const tipMesh = new THREE.Mesh(new THREE.SphereGeometry(9, 16, 16), M_tip);
+tipMesh.position.x = L3;
+wristGroup.add(tipMesh);
+
+// ── TARGET VISUAL ────────────────────────────────────────────────────────────
+const targetSphere = new THREE.Mesh(new THREE.SphereGeometry(14, 24, 24), M_target);
+targetSphere.visible = false;
+scene.add(targetSphere);
+
+const targetRing = new THREE.Mesh(new THREE.RingGeometry(18, 24, 48), M_tring);
+targetRing.rotation.x = -Math.PI/2;
+targetRing.visible = false;
+scene.add(targetRing);
+
+// Vertical dashed line from target sphere to table (made of small spheres)
+const dashGroup = new THREE.Group();
+scene.add(dashGroup);
+
+function updateDashes(tx, tz, ty) {
+  dashGroup.clear();
+  if (!targetSphere.visible) return;
+  const dm = new THREE.MeshBasicMaterial({ color:0xff4400, transparent:true, opacity:.3 });
+  for (let y = TABLE_Y; y < ty; y += 22) {
+    const d = new THREE.Mesh(new THREE.SphereGeometry(2,6,6), dm);
+    d.position.set(tx, y, tz);
+    dashGroup.add(d);
+  }
+}
+
+// ── APPLY IK ANGLES TO ARM ───────────────────────────────────────────────────
+function applyAngles(base, shoulder, elbow) {
+  baseGroup.rotation.y     = base;
+  shoulderGroup.rotation.z = shoulder;
+  elbowGroup.rotation.z    = elbow - Math.PI;
+  wristGroup.rotation.z    = Math.PI - shoulder - elbow;
+}
+
+// ── CAMERA ORBIT ─────────────────────────────────────────────────────────────
+let camTheta = 0.75, camPhi = 0.98, camRadius = 1380;
+const CAM_LOOK = new THREE.Vector3(0, 60, 0);
+
+function updateCamera() {
+  camera.position.set(
+    CAM_LOOK.x + camRadius * Math.sin(camPhi) * Math.cos(camTheta),
+    CAM_LOOK.y + camRadius * Math.cos(camPhi),
+    CAM_LOOK.z + camRadius * Math.sin(camPhi) * Math.sin(camTheta)
+  );
+  camera.lookAt(CAM_LOOK);
+}
+updateCamera();
+
+let isDrag = false, didDrag = false, px = 0, py = 0;
+const wrap = document.getElementById('wrap');
+
+wrap.addEventListener('mousedown', e => { isDrag=true; didDrag=false; px=e.clientX; py=e.clientY; });
+window.addEventListener('mousemove', e => {
+  if (!isDrag) return;
+  const dx=e.clientX-px, dy=e.clientY-py;
+  if (Math.abs(dx)>3||Math.abs(dy)>3) didDrag=true;
+  camTheta -= dx*0.007;
+  camPhi = Math.max(0.12, Math.min(Math.PI/2-0.05, camPhi+dy*0.007));
+  px=e.clientX; py=e.clientY;
+  updateCamera();
+});
+window.addEventListener('mouseup', ()=>isDrag=false);
+wrap.addEventListener('wheel', e => {
+  camRadius = Math.max(350, Math.min(4500, camRadius+e.deltaY*1.4));
+  updateCamera();
+  e.preventDefault();
+}, {passive:false});
+
+// ── CLICK TO SET TARGET ──────────────────────────────────────────────────────
+const raycaster = new THREE.Raycaster();
+const mouse2d   = new THREE.Vector2();
+const hitPt     = new THREE.Vector3();
+const tablePlane= new THREE.Plane(new THREE.Vector3(0,1,0), SHOULDER_HEIGHT);
+
+let hoverZ      = 304.8;
+let lastIKTarget= null;
+
+document.getElementById('h-slider').addEventListener('input', e => {
+  hoverZ = +e.target.value;
+  document.getElementById('h-val').textContent = hoverZ.toFixed(1)+' mm';
+  if (lastIKTarget) applyTarget(lastIKTarget.x3, lastIKTarget.z3);
+});
+
+function applyTarget(x3, z3) {
+  // Three.js X → IK X, Three.js Z (positive = toward viewer) → IK -Y
+  const ik_x = x3;
+  const ik_y = -z3;
+  const ik_z = TABLE_Y + hoverZ;   // height relative to shoulder
+
+  document.getElementById('t-x').textContent = ik_x.toFixed(1)+' mm';
+  document.getElementById('t-y').textContent = ik_y.toFixed(1)+' mm';
+  document.getElementById('t-z').textContent = ik_z.toFixed(1)+' mm';
+
+  const sol = solveIK(ik_x, ik_y, ik_z);
+  if (sol) {
+    targetAngles = { base:sol.base, shoulder:sol.shoulder, elbow:sol.elbow };
+    lastIKTarget = { x3, z3 };
+
+    const ty = TABLE_Y + hoverZ;
+    targetSphere.position.set(x3, ty, z3);
+    targetSphere.visible = true;
+    targetRing.position.set(x3, TABLE_Y+2, z3);
+    targetRing.visible = true;
+    updateDashes(x3, z3, ty);
+
+    document.getElementById('t-status').textContent = 'REACHABLE';
+    document.getElementById('t-status').className = 'ok';
+    document.getElementById('a-wri').textContent = sol.wrist_motor_deg.toFixed(1)+'°';
+    const wp = Math.min(100, Math.abs(sol.wrist_motor_deg)/360*100);
+    document.getElementById('f-wri').style.width = wp+'%';
+  } else {
+    document.getElementById('t-status').textContent = 'OUT OF REACH';
+    document.getElementById('t-status').className = 'err';
+  }
+}
+
+wrap.addEventListener('click', e => {
+  if (didDrag) return;
+  const rect = wrap.getBoundingClientRect();
+  mouse2d.x =  ((e.clientX-rect.left)/rect.width )*2-1;
+  mouse2d.y = -((e.clientY-rect.top) /rect.height)*2+1;
+  raycaster.setFromCamera(mouse2d, camera);
+  if (raycaster.ray.intersectPlane(tablePlane, hitPt)) {
+    applyTarget(hitPt.x, hitPt.z);
+  }
+});
+
+// ── ANIMATION STATE ──────────────────────────────────────────────────────────
+// Default: a nice natural pose
+let cur = { base:0.4, shoulder:0.55, elbow:1.9 };
+let targetAngles = { base:0.4, shoulder:0.55, elbow:1.9 };
+const SPEED = 0.055;
+
+function lerpA(a, b, t) {
+  let d = b-a;
+  while (d>Math.PI)  d-=2*Math.PI;
+  while (d<-Math.PI) d+=2*Math.PI;
+  return a+d*t;
+}
+
+// ── UI UPDATE ────────────────────────────────────────────────────────────────
+function updateUI() {
+  const deg = r => (r*180/Math.PI).toFixed(1)+'°';
+  const pct = (r,mx) => Math.min(100, Math.abs(r/mx)*100).toFixed(0)+'%';
+  document.getElementById('a-base').textContent = deg(cur.base);
+  document.getElementById('a-sho').textContent  = deg(cur.shoulder);
+  document.getElementById('a-elb').textContent  = deg(cur.elbow);
+  document.getElementById('f-base').style.width = pct(cur.base, Math.PI);
+  document.getElementById('f-sho').style.width  = pct(cur.shoulder, Math.PI/2);
+  document.getElementById('f-elb').style.width  = pct(cur.elbow, Math.PI);
+}
+
+// ── RESIZE ───────────────────────────────────────────────────────────────────
+function onResize() {
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  renderer.setSize(w,h);
+  camera.aspect = w/h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+onResize();
+
+// ── RENDER LOOP ──────────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  cur.base     = lerpA(cur.base,     targetAngles.base,     SPEED);
+  cur.shoulder = lerpA(cur.shoulder, targetAngles.shoulder, SPEED);
+  cur.elbow    = lerpA(cur.elbow,    targetAngles.elbow,    SPEED);
+  applyAngles(cur.base, cur.shoulder, cur.elbow);
+
+  // Move cyan point light to follow tool tip
+  const tipW = new THREE.Vector3();
+  tipMesh.getWorldPosition(tipW);
+  cyanPt.position.lerp(tipW, 0.08);
+
+  updateUI();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
