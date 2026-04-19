@@ -1,48 +1,61 @@
-import speech_recognition as sr
 import os
 import time
+from typing import Callable
 
-# Initialize the speech recognizer
-r = sr.Recognizer()
+import speech_recognition as sr
+
+
+_recognizer = sr.Recognizer()
+
 
 def take_picture():
     """Generates a timestamped filename and captures an image using the Brio."""
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     filename = f"photo_{timestamp}.jpg"
     print(f"\n📸 Snapping photo with Brio: {filename}")
-    
-    # Executing fswebcam targeting /dev/video4
-    os.system(f"fswebcam -d /dev/video4 -r 1920x1080 --no-banner {filename} > /dev/null 2>&1")
+    os.system(
+        f"fswebcam -d /dev/video4 -r 1920x1080 --no-banner {filename} > /dev/null 2>&1"
+    )
     print("✅ Picture saved!\n")
 
-# Use the default microphone as the audio source
-with sr.Microphone() as source:
-    print("Adjusting for ambient noise... Please wait.")
-    r.adjust_for_ambient_noise(source, duration=2)
-    print("🎙️ Ready! Say 'take picture' or 'cheese' to snap a photo.")
-    print("Press Ctrl+C to stop.")
 
-    while True:
-        try:
-            # Listen for audio, timing out after 5 seconds of silence
-            audio = r.listen(source, timeout=5, phrase_time_limit=5)
-            
-            # Using Google's free speech recognition (requires internet)
-            command = r.recognize_google(audio).lower()
-            print(f"Heard: '{command}'")
+def listen_transcripts(
+    on_text: Callable[[str], None],
+    stop_flag: Callable[[], bool],
+    timeout: float = 2.0,
+    phrase_time_limit: float = 6.0,
+    ambient_duration: float = 2.0,
+) -> None:
+    """Blocking microphone loop. Calls on_text(str) for each recognized utterance.
+    Exits when stop_flag() returns True (checked between listen windows)."""
+    with sr.Microphone() as source:
+        print("🎙️ Adjusting for ambient noise...")
+        _recognizer.adjust_for_ambient_noise(source, duration=ambient_duration)
+        print("🎙️ Voice listener ready.")
 
-            # Check if our trigger words are in the recognized text
-            if "take picture" in command or "cheese" in command:
-                take_picture()
+        while not stop_flag():
+            try:
+                audio = _recognizer.listen(
+                    source, timeout=timeout, phrase_time_limit=phrase_time_limit
+                )
+                text = _recognizer.recognize_google(audio).lower().strip()
+                if text:
+                    on_text(text)
+            except sr.WaitTimeoutError:
+                pass
+            except sr.UnknownValueError:
+                pass
+            except sr.RequestError as e:
+                print(f"[voice] Google Speech API error: {e}")
 
-        except sr.WaitTimeoutError:
-            # Re-loop if no speech is detected
-            pass
-        except sr.UnknownValueError:
-            # Audio was detected, but couldn't be understood
-            print("...") 
-        except sr.RequestError as e:
-            print(f"Could not request results from Google Speech Recognition; {e}")
-        except KeyboardInterrupt:
-            print("\nExiting script...")
-            break
+
+if __name__ == "__main__":
+    def _cb(text: str) -> None:
+        print(f"Heard: '{text}'")
+        if "take picture" in text or "cheese" in text:
+            take_picture()
+
+    try:
+        listen_transcripts(_cb, stop_flag=lambda: False)
+    except KeyboardInterrupt:
+        print("\nExiting script...")

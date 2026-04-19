@@ -10,26 +10,32 @@ from ik_solver import move_to
 from serial_bridge import connect, send_angles, home # fix to actual code
 from gesture_recognizer import NPUGestureRecognizer, GestureResult
 
+from cv_lib.voice_recognition import listen_transcripts, take_picture
+
 # Shared state
 LATEST_RESULT = None
 LATEST_FRAME  = None
 ARM_BUSY      = False # true while moving
+AI_BUSY       = False # true while Gemini is thinking/speaking
 HOMOGRAPHY_MATRIX = None # loaded at startup
+assistant     = None  # lazy cv_lib.WorkbenchAssistant (multi-turn chat)
 
 # Thread locks
 frame_lock = threading.Lock()
 result_lock = threading.Lock()
 busy_lock = threading.Lock()
+ai_busy_lock = threading.Lock()
 
 command_queue = queue.Queue()
 
-# Define enum states, not sure 
+# Define enum states, not sure
 class State(enum.Enum):
     SLEEP = "sleep"
     READY = "ready"
     FOLLOW = "follow"
     HOLD = "hold"
     RECORD = "record"
+    CONVERSATION = "conversation"
 
 
 class ArmController:
@@ -54,6 +60,116 @@ class ArmController:
         self.transition(State.SLEEP)
 
 controller = ArmController()  # instantiate class -> everything else calls to this
+
+
+# ── Voice routing tables ─────────────────────────────────────────────────────
+# Order matters: longer phrases first so "stop following" wins over "stop".
+VOICE_CMD_MAP = [
+    (("stop following", "stop follow"),       "STOP_FOLLOW",  None),
+    (("follow me", "follow", "track my finger"),                 "FOLLOW",       None),
+    (("stop recording", "end recording"),                     "STOP_RECORD",  None),
+    (("start recording", "record"),           "RECORD",       None),
+    (("hold", "freeze", "stop"),                            "HOLD",         None),
+    (("release", "resume", "continue", "unfreeze"),       "RELEASE",      None),
+    (("go home", "home position", "home"),    "HOME",         None),
+    (("wake up", "wake"),                     "WAKE",         None),
+    (("go to sleep", "sleep"),                "SLEEP",        None),
+    (("take picture", "cheese", "snap"),      "TAKE_PICTURE", None),
+]
+
+WAKE_PHRASES = ("hey ariel", "you're crazy")
+EXIT_PHRASES = ("done", "stop talking", "thanks ariel", "goodbye", "shut up", "i'ma kill you")
+
+
+def _run_ai(question: str):
+    """Spawned per ASK_AI. Uses the multi-turn WorkbenchAssistant so follow-ups
+    retain history. Gemini speaks its reply internally via TTS."""
+    global AI_BUSY, assistant
+    with ai_busy_lock:
+        AI_BUSY = True
+    try:
+        if assistant is None:
+            from cv_lib import WorkbenchAssistant
+            assistant = WorkbenchAssistant()
+        print(f"[ai] asking: {question}")
+        assistant.ask(question)
+    except Exception as e:
+        print(f"[ai] failed: {e}")
+    finally:
+        with ai_busy_lock:
+            AI_BUSY = False
+
+
+def _match_voice_command(text: str):
+    """Returns (cmd, payload) if text hits the command table, else None."""
+    for phrases, cmd, payload in VOICE_CMD_MAP:
+        if any(p in text for p in phrases):
+            return cmd, payload
+    return None
+
+
+def _dispatch_or_take_picture(cmd: str, payload):
+    """TAKE_PICTURE bypasses the dispatcher (it's not state-machine business).
+    Everything else goes on the queue."""
+    if cmd == "TAKE_PICTURE":
+        threading.Thread(target=take_picture, daemon=True).start()
+    else:
+        command_queue.put((cmd, payload))
+
+
+def _voice_cmd_on_text(text: str) -> bool:
+    """Plan A: pure command routing. Returns True if the transcript was handled."""
+    hit = _match_voice_command(text)
+    if hit is None:
+        return False
+    cmd, payload = hit
+    print(f"[voice→dispatch] '{text}' → {cmd}")
+    _dispatch_or_take_picture(cmd, payload)
+    return True
+
+
+def _voice_ai_on_text(text: str) -> bool:
+    """Plan B: hybrid wake-phrase / conversation routing. Returns True if handled."""
+    # 1. Exit phrase while in conversation
+    if controller.is_in(State.CONVERSATION) and any(p in text for p in EXIT_PHRASES):
+        print(f"[voice→ai] exit: '{text}'")
+        command_queue.put(("END_CONVERSATION", None))
+        return True
+
+    # 2. Wake phrase enters (or stays in) conversation; remainder is the question
+    wake_hit = next((p for p in WAKE_PHRASES if p in text), None)
+    if wake_hit:
+        if not controller.is_in(State.CONVERSATION):
+            command_queue.put(("START_CONVERSATION", None))
+        remainder = text.split(wake_hit, 1)[1].strip(" ,.?!")
+        if remainder:
+            command_queue.put(("ASK_AI", remainder))
+        print(f"[voice→ai] wake: '{text}' remainder='{remainder}'")
+        return True
+
+    # 3. Inside CONVERSATION: hybrid — commands still dispatch, else route to AI
+    if controller.is_in(State.CONVERSATION):
+        hit = _match_voice_command(text)
+        if hit is not None:
+            cmd, payload = hit
+            print(f"[voice→ai/cmd] '{text}' → {cmd}")
+            _dispatch_or_take_picture(cmd, payload)
+            return True
+        print(f"[voice→ai] follow-up: '{text}'")
+        command_queue.put(("ASK_AI", text))
+        return True
+
+    return False
+
+
+def _voice_on_text(text: str):
+    """Combined callback: AI/conversation routing first, command fallback after."""
+    if _voice_ai_on_text(text):
+        return
+    if _voice_cmd_on_text(text):
+        return
+    print(f"[voice] ignored: '{text}'")
+
 
 def startup(): #runs before any threads
     global HOMOGRAPHY_MATRIX
@@ -288,7 +404,30 @@ def dispatcher_loop():
                 home()
             except Exception as e:
                 print(f"Failed: {e}")
- 
+
+        elif cmd == "START_CONVERSATION":
+            if controller.is_in(State.READY):
+                controller.transition(State.CONVERSATION)
+            else:
+                print(f"Ignoring START_CONVERSATION, state is {controller.state.value}")
+
+        elif cmd == "END_CONVERSATION":
+            if controller.is_in(State.CONVERSATION):
+                controller.transition(State.READY)
+
+        elif cmd == "ASK_AI":
+            if not payload:
+                print("[ai] empty payload, skipping")
+            elif AI_BUSY:
+                print(f"[ai] busy, dropping '{payload}'")
+            else:
+                threading.Thread(target=_run_ai, args=(payload,), daemon=True).start()
+
+        elif cmd == "RESET_AI":
+            if assistant is not None:
+                assistant.reset()
+                print("[ai] conversation memory cleared")
+
         else:
             print(f"Unknown command: {cmd}")
  
@@ -311,11 +450,12 @@ def display_loop():
  
         # State overlay, top left
         state_color = {
-            State.SLEEP:  (100, 100, 100),
-            State.READY:  (0,   200,  0),
-            State.FOLLOW: (0,   200, 255),
-            State.HOLD:   (0,   120, 255),
-            State.RECORD: (0,     0, 255),
+            State.SLEEP:        (100, 100, 100),
+            State.READY:        (0,   200,   0),
+            State.FOLLOW:       (0,   200, 255),
+            State.HOLD:         (0,   120, 255),
+            State.RECORD:       (0,     0, 255),
+            State.CONVERSATION: (255, 120, 200),
         }.get(controller.state, (255, 255, 255))
  
         cv2.rectangle(frame, (0, 0), (200, 36), (0, 0, 0), -1)
@@ -369,6 +509,11 @@ if __name__ == "__main__":
     threading.Thread(target=capture_loop,    args=(cap,),        daemon=True).start()
     threading.Thread(target=inference_loop,  args=(recognizer,), daemon=True).start()
     threading.Thread(target=dispatcher_loop,                     daemon=True).start()
+    threading.Thread(
+        target=listen_transcripts,
+        args=(_voice_on_text, lambda: not controller.running),
+        daemon=True,
+    ).start()
  
     print("All threads started")
     print("Press Q in the camera window to quit\n")
