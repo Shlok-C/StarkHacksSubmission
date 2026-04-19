@@ -3,7 +3,10 @@ from .gesture_recognition import (
     classify_gesture, resolve_command, pointing_direction, pinch_distance,
     draw_landmarks, draw_overlay,
 )
-from .npu_runtime import NPUInterpreter
+try:
+    from .npu_runtime import NPUInterpreter
+except Exception:
+    pass  # ai_edge_litert / qai_appbuilder not installed on laptop
 from .context import workbench_context, WorkbenchContext, WorkbenchSnapshot
 from .gemini import WorkbenchAssistant, ask_question
 from .comp_recognition import *

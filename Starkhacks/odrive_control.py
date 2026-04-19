@@ -1,5 +1,7 @@
+import queue
 import serial
 import serial.tools.list_ports
+import threading
 import time
 
 import lcm
@@ -166,6 +168,29 @@ def jog(val2):
     axis.controller.input_pos = target
 
 # =========================
+# ENCODER ZERO (firmware-compatibility shim)
+# =========================
+def _zero_encoder(axis):
+    """Reset the encoder position to 0. The API name changed between ODrive
+    firmware versions; try each. Raises RuntimeError if none exist."""
+    # 0.5.x: axis.encoder.set_linear_count(int)
+    if hasattr(axis, "encoder") and hasattr(axis.encoder, "set_linear_count"):
+        axis.encoder.set_linear_count(0)
+        return
+    # 0.6+: axis.pos_vel_mapper.input_pos_rev_set(0)  / axis.set_abs_pos(0)
+    if hasattr(axis, "set_abs_pos"):
+        axis.set_abs_pos(0.0)
+        return
+    if hasattr(axis, "pos_vel_mapper") and hasattr(axis.pos_vel_mapper, "input_pos_rev_set"):
+        axis.pos_vel_mapper.input_pos_rev_set(0.0)
+        return
+    raise RuntimeError(
+        "ODrive firmware has no known 'zero encoder' API — "
+        "update _zero_encoder() for your firmware version."
+    )
+
+
+# =========================
 # HOMING
 # =========================
 def get_home():
@@ -212,8 +237,8 @@ def get_home():
     while abs(axis.encoder.pos_estimate - target) > 0.05:
         time.sleep(0.01)
 
-    # Set home = 0
-    axis.encoder.set_linear_count(0)
+    # Set home = 0. API moved between ODrive firmware versions, so try each.
+    _zero_encoder(axis)
     axis.controller.input_pos = 0
 
     axis.controller.config.input_mode = InputMode.PASSTHROUGH
@@ -235,6 +260,41 @@ def move_to_angle(angle_deg):
     axis.controller.input_pos = target
 
 # =========================
+# SERIAL READER THREAD
+# =========================
+# Previously ser.readline() blocked the main loop up to 1s, starving
+# lc.handle_timeout(0). Run serial in its own daemon thread that feeds lines
+# into a queue; main loop polls both LCM and the queue without blocking.
+_serial_queue = queue.Queue(maxsize=256)
+_stop_serial = threading.Event()
+
+
+def _serial_reader():
+    while not _stop_serial.is_set():
+        try:
+            raw = ser.readline()
+        except Exception as e:
+            print(f"[serial] reader error: {e}")
+            time.sleep(0.1)
+            continue
+        if not raw:
+            continue
+        try:
+            line = raw.decode().strip()
+        except UnicodeDecodeError:
+            continue
+        if not line:
+            continue
+        try:
+            _serial_queue.put_nowait(line)
+        except queue.Full:
+            pass  # drop oldest isn't trivial; just drop this one
+
+
+threading.Thread(target=_serial_reader, daemon=True).start()
+
+
+# =========================
 # MAIN LOOP
 # =========================
 calibrate()
@@ -245,10 +305,13 @@ last_mode = None
 
 while True:
     try:
-        lc.handle_timeout(0)
+        # Block up to 50 ms servicing LCM (shoulder target updates).
+        lc.handle_timeout(50)
 
-        line = ser.readline().decode().strip()
-        if not line:
+        # Drain any serial lines that arrived in the meantime.
+        try:
+            line = _serial_queue.get_nowait()
+        except queue.Empty:
             continue
 
         decoded = decode_msg(line)
@@ -281,10 +344,12 @@ while True:
 
     except KeyboardInterrupt:
         print("Stopping")
+        _stop_serial.set()
         axis.controller.input_pos = axis.encoder.pos_estimate
         axis.requested_state = AxisState.IDLE
         break
 
     except Exception as e:
         print(f"Error: {e}")
+        _stop_serial.set()
         break

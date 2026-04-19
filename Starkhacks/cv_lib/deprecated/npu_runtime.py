@@ -1,4 +1,5 @@
 """
+DEPRECATED: kept for reference only. Not imported by cv_lib.
 NPU-accelerated inference wrapper for RUBIK Pi 3 (Qualcomm QCS6490).
 
 Backend selection (automatic, in priority order):

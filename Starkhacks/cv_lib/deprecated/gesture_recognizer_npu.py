@@ -1,3 +1,7 @@
+# DEPRECATED: Qualcomm NPU/HTP gesture recognizer. Kept for reference only.
+# Active code uses cv_lib.gesture_recognition.MediaPipeGestureRecognizer instead.
+# Importing this module is safe (no side effects); run as a script to serve
+# the MJPEG debug stream.
 import cv2
 import sys
 import mediapipe as mp
@@ -13,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from ai_edge_litert.interpreter import Interpreter, load_delegate
 
 # --- Configuration & Constants ---
+CAMERA_INDEX = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 PORT = 8080
 NPU_MODEL_PATH = "models/old/mediapipe_hand_gesture-canned_gesture_classifier-w8a8.tflite"
 
@@ -210,8 +215,7 @@ def _inference_loop():
 
 
 if __name__ == "__main__":
-    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-    cap = cv2.VideoCapture(camera_index)
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 

@@ -21,6 +21,30 @@ Z_HOVER = 12 * 25.4   # 304.8 mm — default hover height ABOVE TABLE
 Z_MIN   = 4  * 25.4   # 101.6 mm — minimum hover height above table (safety floor)
                        # IK z for minimum = TABLE_Z + Z_MIN = -53.5 mm
 
+# CALIBRATE: joint range limits (degrees). Anything outside these ranges is
+# rejected by is_reachable() so the arm can't be commanded into a mechanical
+# stop. Tune each (min, max) to match your physical build.
+JOINT_LIMITS = {
+    "base":     (-180.0,  180.0),
+    "shoulder": (-10.0,   190.0),
+    "elbow":    (0.0,     180.0),
+    "wrist":    (-180.0,  180.0),
+}
+
+
+def _within_limits(th_b, th_s, th_e, th_w):
+    """Return True iff every joint angle is inside its JOINT_LIMITS range."""
+    for name, value in (
+        ("base", th_b),
+        ("shoulder", th_s),
+        ("elbow", th_e),
+        ("wrist", th_w),
+    ):
+        lo, hi = JOINT_LIMITS[name]
+        if not (lo <= value <= hi):
+            return False, name, value, (lo, hi)
+    return True, None, None, None
+
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -115,6 +139,14 @@ def move_to(x_raw, y_raw, z_above_table=Z_HOVER):
         return None
 
     th_b, th_s, th_e, th_w = solve(x, y, z)
+
+    ok, bad_joint, bad_val, bad_range = _within_limits(th_b, th_s, th_e, th_w)
+    if not ok:
+        print(
+            f"  [IK] JOINT LIMIT VIOLATION  {bad_joint}={bad_val:.1f}° "
+            f"outside {bad_range}"
+        )
+        return None
 
     print(f"  [IK] Base: {th_b:7.2f}°  Shoulder: {th_s:7.2f}°  "
           f"Elbow: {th_e:7.2f}°  Wrist: {th_w:7.2f}°")
