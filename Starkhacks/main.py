@@ -5,44 +5,124 @@ import numpy as np
 import cv2
 import enum
 import sys
+import os
+import serial
+import serial.tools.list_ports
+import lcm
 
-from ik_solver import move_to
-from serial_bridge import connect, send_angles, home # fix to actual code
-from gesture_recognizer import NPUGestureRecognizer, GestureResult
-
+# new_ik.py lives two directories above this file (project root)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from new_ik import move_to
+from cv_lib.gesture_recognizer import NPUGestureRecognizer, GestureResult
 from cv_lib.voice_recognition import listen_transcripts, take_picture
+from mytypes.arm_angles import arm_angles as ArmAngles
 
 # Shared state
-LATEST_RESULT = None
-LATEST_FRAME  = None
-ARM_BUSY      = False # true while moving
-AI_BUSY       = False # true while Gemini is thinking/speaking
-HOMOGRAPHY_MATRIX = None # loaded at startup
-assistant     = None  # lazy cv_lib.WorkbenchAssistant (multi-turn chat)
+LATEST_RESULT     = None
+LATEST_FRAME      = None
+ARM_BUSY          = False
+AI_BUSY           = False
+HOMOGRAPHY_MATRIX = None
+FRAME_W           = 640   # updated from first real frame
+FRAME_H           = 480   # CALIBRATE: match actual camera resolution
+assistant         = None
 
 # Thread locks
-frame_lock = threading.Lock()
-result_lock = threading.Lock()
-busy_lock = threading.Lock()
-ai_busy_lock = threading.Lock()
+frame_lock    = threading.Lock()
+result_lock   = threading.Lock()
+busy_lock     = threading.Lock()
+ai_busy_lock  = threading.Lock()
 
 command_queue = queue.Queue()
 
-# Define enum states, not sure
+# Serial connection to Arduino Mega (set in connect())
+_ser = None
+
+# LCM publisher (shared — LCM is thread-safe for publish)
+lc = lcm.LCM()
+
+
+# ── Serial helpers ─────────────────────────────────────────────────────────────
+
+def _find_mega():
+    """Auto-detect Arduino Mega by USB VID/PID."""
+    for port in serial.tools.list_ports.comports():
+        vid, pid = port.vid, port.pid
+        print(f"  {port.device} | VID:{vid:#06x} PID:{pid:#06x} | {port.description}")
+        if vid == 0x2341 and pid in (0x0042, 0x0010):   # official Mega
+            print(f"  → official Mega")
+            return port.device
+        if vid in (0x1A86, 0x10C4):                      # CH340 / CP210x clone
+            print(f"  → clone Mega (CH340/CP210x)")
+            return port.device
+    return None
+
+
+def connect():
+    global _ser
+    device = _find_mega()
+    if device is None:
+        raise RuntimeError("No Arduino Mega found on any USB port")
+    _ser = serial.Serial(device, 115200, timeout=1)
+    time.sleep(2)                    # wait for Arduino bootloader reset
+    _ser.reset_input_buffer()
+    print(f"[serial] connected: {device}")
+
+
+def send_angles(th_b, th_e):
+    """Send base and elbow angles to Arduino Mega.
+
+    Protocol (ASCII, newline-terminated):
+        A,<base_deg>,<elbow_deg>\\n
+
+    Arduino drives:
+      TMC2208 stepper → base  (th_b)
+      L298N stepper   → elbow (th_e)
+    Shoulder → ODrive via LCM only, not here.
+    # WRIST: pass th_w here and append to line once wrist hardware is ready.
+    """
+    if _ser is None:
+        print("[serial] not connected — skipping send_angles")
+        return
+    line = f"A,{th_b:.2f},{th_e:.2f}\n"
+    _ser.write(line.encode())
+
+
+def home():
+    """Tell Arduino to execute homing sequence. Protocol: 'H\\n'"""
+    if _ser is None:
+        print("[serial] not connected — skipping home")
+        return
+    _ser.write(b"H\n")
+
+
+# ── LCM publisher ──────────────────────────────────────────────────────────────
+
+def _publish_lcm(th_b, th_s, th_e):
+    """Publish angles on TARGET_ANGLE so odrive_control.py drives the shoulder."""
+    msg          = ArmAngles()
+    msg.base     = float(th_b)
+    msg.shoulder = float(th_s)
+    msg.elbow    = float(th_e)
+    lc.publish("TARGET_ANGLE", msg.encode())
+
+
+# ── State machine ──────────────────────────────────────────────────────────────
+
 class State(enum.Enum):
-    SLEEP = "sleep"
-    READY = "ready"
-    FOLLOW = "follow"
-    HOLD = "hold"
-    RECORD = "record"
+    SLEEP        = "sleep"
+    READY        = "ready"
+    FOLLOW       = "follow"
+    HOLD         = "hold"
+    RECORD       = "record"
     CONVERSATION = "conversation"
 
 
 class ArmController:
     def __init__(self):
-        self.state = State.SLEEP
+        self.state   = State.SLEEP
         self.running = False
-    
+
     def transition(self, new_state):
         old = self.state
         self.state = new_state
@@ -50,31 +130,32 @@ class ArmController:
 
     def is_in(self, state):
         return self.state == state
-    
+
     def start(self):
         self.running = True
         self.transition(State.READY)
-    
+
     def stop(self):
         self.running = False
         self.transition(State.SLEEP)
 
-controller = ArmController()  # instantiate class -> everything else calls to this
+
+controller = ArmController()
 
 
-# ── Voice routing tables ─────────────────────────────────────────────────────
+# ── Voice routing ──────────────────────────────────────────────────────────────
 # Order matters: longer phrases first so "stop following" wins over "stop".
 VOICE_CMD_MAP = [
-    (("stop following", "stop follow"),       "STOP_FOLLOW",  None),
-    (("follow me", "follow", "track my finger"),                 "FOLLOW",       None),
-    (("stop recording", "end recording"),                     "STOP_RECORD",  None),
-    (("start recording", "record"),           "RECORD",       None),
-    (("hold", "freeze", "stop"),                            "HOLD",         None),
-    (("release", "resume", "continue", "unfreeze"),       "RELEASE",      None),
-    (("go home", "home position", "home"),    "HOME",         None),
-    (("wake up", "wake"),                     "WAKE",         None),
-    (("go to sleep", "sleep"),                "SLEEP",        None),
-    (("take picture", "cheese", "snap"),      "TAKE_PICTURE", None),
+    (("stop following", "stop follow"),             "STOP_FOLLOW",  None),
+    (("follow me", "follow", "track my finger"),    "FOLLOW",       None),
+    (("stop recording", "end recording"),           "STOP_RECORD",  None),
+    (("start recording", "record"),                 "RECORD",       None),
+    (("hold", "freeze", "stop"),                    "HOLD",         None),
+    (("release", "resume", "continue", "unfreeze"), "RELEASE",      None),
+    (("go home", "home position", "home"),          "HOME",         None),
+    (("wake up", "wake"),                           "WAKE",         None),
+    (("go to sleep", "sleep"),                      "SLEEP",        None),
+    (("take picture", "cheese", "snap"),            "TAKE_PICTURE", None),
 ]
 
 WAKE_PHRASES = ("hey ariel", "you're crazy")
@@ -82,8 +163,7 @@ EXIT_PHRASES = ("done", "stop talking", "thanks ariel", "goodbye", "shut up", "i
 
 
 def _run_ai(question: str):
-    """Spawned per ASK_AI. Uses the multi-turn WorkbenchAssistant so follow-ups
-    retain history. Gemini speaks its reply internally via TTS."""
+    """Spawned per ASK_AI. Multi-turn WorkbenchAssistant retains history."""
     global AI_BUSY, assistant
     with ai_busy_lock:
         AI_BUSY = True
@@ -101,7 +181,6 @@ def _run_ai(question: str):
 
 
 def _match_voice_command(text: str):
-    """Returns (cmd, payload) if text hits the command table, else None."""
     for phrases, cmd, payload in VOICE_CMD_MAP:
         if any(p in text for p in phrases):
             return cmd, payload
@@ -109,8 +188,6 @@ def _match_voice_command(text: str):
 
 
 def _dispatch_or_take_picture(cmd: str, payload):
-    """TAKE_PICTURE bypasses the dispatcher (it's not state-machine business).
-    Everything else goes on the queue."""
     if cmd == "TAKE_PICTURE":
         threading.Thread(target=take_picture, daemon=True).start()
     else:
@@ -118,7 +195,6 @@ def _dispatch_or_take_picture(cmd: str, payload):
 
 
 def _voice_cmd_on_text(text: str) -> bool:
-    """Plan A: pure command routing. Returns True if the transcript was handled."""
     hit = _match_voice_command(text)
     if hit is None:
         return False
@@ -129,14 +205,11 @@ def _voice_cmd_on_text(text: str) -> bool:
 
 
 def _voice_ai_on_text(text: str) -> bool:
-    """Plan B: hybrid wake-phrase / conversation routing. Returns True if handled."""
-    # 1. Exit phrase while in conversation
     if controller.is_in(State.CONVERSATION) and any(p in text for p in EXIT_PHRASES):
         print(f"[voice→ai] exit: '{text}'")
         command_queue.put(("END_CONVERSATION", None))
         return True
 
-    # 2. Wake phrase enters (or stays in) conversation; remainder is the question
     wake_hit = next((p for p in WAKE_PHRASES if p in text), None)
     if wake_hit:
         if not controller.is_in(State.CONVERSATION):
@@ -147,7 +220,6 @@ def _voice_ai_on_text(text: str) -> bool:
         print(f"[voice→ai] wake: '{text}' remainder='{remainder}'")
         return True
 
-    # 3. Inside CONVERSATION: hybrid — commands still dispatch, else route to AI
     if controller.is_in(State.CONVERSATION):
         hit = _match_voice_command(text)
         if hit is not None:
@@ -163,7 +235,6 @@ def _voice_ai_on_text(text: str) -> bool:
 
 
 def _voice_on_text(text: str):
-    """Combined callback: AI/conversation routing first, command fallback after."""
     if _voice_ai_on_text(text):
         return
     if _voice_cmd_on_text(text):
@@ -171,19 +242,19 @@ def _voice_on_text(text: str):
     print(f"[voice] ignored: '{text}'")
 
 
-def startup(): #runs before any threads
-    global HOMOGRAPHY_MATRIX
+# ── Startup ────────────────────────────────────────────────────────────────────
 
+def startup():
+    global HOMOGRAPHY_MATRIX
     try:
-        HOMOGRAPHY_MATRIX = np.loap("homography_matrix.npy")
+        HOMOGRAPHY_MATRIX = np.load("homography_matrix.npy")
         print("Loaded homography matrix")
     except FileNotFoundError:
-        print("No homography matrix found")
+        print("No homography matrix found — run calibration first")
         sys.exit(1)
 
     try:
         connect()
-        print("Connected to serial port")
     except Exception as e:
         print(f"Failed to connect to serial port: {e}")
         sys.exit(1)
@@ -192,224 +263,222 @@ def startup(): #runs before any threads
     print("LFG!")
 
 
-def pixel_to_mm(u,v):
+# ── Pixel → mm ─────────────────────────────────────────────────────────────────
+
+def pixel_to_mm(u, v):
     if HOMOGRAPHY_MATRIX is None:
         return None
-    
-    pt = np.array([[[float(u),float(v)]]],dtype=np.float32)
-    result = cv2.perspectiveTransform(pt,HOMOGRAPHY_MATRIX)
+    pt     = np.array([[[float(u), float(v)]]], dtype=np.float32)
+    result = cv2.perspectiveTransform(pt, HOMOGRAPHY_MATRIX)
     x_mm, y_mm = result[0][0]
     return x_mm, y_mm
 
 
-def capture_loop(cap):  # capture and store latest frame, no processing
-    global LATEST_FRAME
+# ── Camera threads ─────────────────────────────────────────────────────────────
+
+def capture_loop(cap):
+    global LATEST_FRAME, FRAME_W, FRAME_H
     while controller.running:
         ok, frame = cap.read()
         if ok:
             with frame_lock:
-                LATEST_FRAME = frame  # ovewrite with newest frame
+                LATEST_FRAME = frame
+                FRAME_H, FRAME_W = frame.shape[:2]
 
 
 def inference_loop(recognizer):
     global LATEST_RESULT
     while controller.running:
-        # use copy of latest frame
         with frame_lock:
-            if LATEST_FRAME is None:
-                frame = None
-            else:
-                frame = LATEST_FRAME.copy()
-
+            frame = LATEST_FRAME.copy() if LATEST_FRAME is not None else None
 
         if frame is None:
             time.sleep(0.01)
             continue
 
-        frame = cv2.flip(frame,1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame  = cv2.flip(frame, 1)
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = recognizer.process(rgb)
 
-        # run NPU gesture recognition (SHLOK)
-        result = recognizer.recognize(rgb)
-
-        # store results for other threads
         with result_lock:
             LATEST_RESULT = result
 
-        # if a clear movement command is detected, then push to dispatcher
-        # only push if not already busy
-        if result.command =="MOVE_DIRECTED" and not ARM_BUSY:
-            try:
-                command_queue.put_nowait("MOVE_DIRECTED", result)
-            except queue.Full:
-                pass
+        if result.command == "MOVE_DIRECTED":
+            with busy_lock:
+                arm_busy = ARM_BUSY
+            if not arm_busy:
+                try:
+                    command_queue.put_nowait(("MOVE_DIRECTED", result))
+                except queue.Full:
+                    pass
 
 
-# Executor, its own thread runs the full pipeline pixel → mm → IK → serial.
+# ── Move execution: pixel → mm → IK → LCM + serial ───────────────────────────
+
 def execute_move(result):
     global ARM_BUSY
- 
-    # Mark arm as busy so inference_loop stops flooding commands
+
     with busy_lock:
         ARM_BUSY = True
- 
+
     try:
         if result.landmarks is None:
-            print("No landmarks in result, skipping")
+            print("[move] no landmarks, skipping")
             return
- 
-        # Get the index finger tip pixel (landmark 8)
-        # landmarks are normalized [0,1], multiply by frame size to get pixels
-        lm  = result.landmarks[8]
-        u   = int(lm.x * 640)
-        v   = int(lm.y * 480)
- 
-        # Convert pixel to real-world mm using homography
+
+        # Index finger tip = landmark 8, normalized [0,1] → actual pixels
+        lm = result.landmarks[8]
+        with frame_lock:
+            w, h = FRAME_W, FRAME_H
+        u = int(lm.x * w)
+        v = int(lm.y * h)
+
         coords = pixel_to_mm(u, v)
         if coords is None:
-            print("Homography not loaded, cannot convert pixel to mm")
+            print("[move] homography not loaded")
             return
- 
+
         x_mm, y_mm = coords
-        print(f"Target pixel ({u}, {v}) → ({x_mm:.1f} mm, {y_mm:.1f} mm)")
- 
-        # Run IK solver, returns angles or None if unreachable
+        print(f"[move] pixel ({u},{v}) → ({x_mm:.1f} mm, {y_mm:.1f} mm)")
+
+        # CALIBRATE: Z is fixed at Z_HOVER defined in arm_lib/ik.py
         angles = move_to(x_mm, y_mm)
         if angles is None:
-            print("Target unreachable, no command sent")
+            print("[move] target unreachable")
             return
- 
-        th_b, th_s, th_e, th_w = angles
- 
-        # Send angles to Arduino over serial, IMPLEMENT THIS!!
-        send_angles(th_b, th_s, th_e, th_w)
-        print(f"Angles sent, waiting for DONE")
- 
+
+        th_b, th_s, th_e, th_w = angles  # th_w kept for when wrist is ready
+        print(f"[move] base={th_b:.1f}° shoulder={th_s:.1f}° elbow={th_e:.1f}°"
+              # f" wrist={th_w:.1f}°"  # uncomment when wrist hardware is active
+              )
+
+        # 1. Publish shoulder angle to ODrive via LCM (base/elbow included for logging)
+        _publish_lcm(th_b, th_s, th_e)
+
+        # 2. Send base + elbow to Arduino Mega; shoulder → ODrive only
+        send_angles(th_b, th_e)
+        # send_angles(th_b, th_e, th_w)  # uncomment when wrist hardware is active
+
     finally:
-        # Always release busy flag, even if something went wrong above, prevents locking up
         with busy_lock:
             ARM_BUSY = False
- 
 
-# FOLLOW Mode
-# Every 100ms, reads the latest hand position and sends a move command.
+
+# ── Follow mode ────────────────────────────────────────────────────────────────
+
+# CALIBRATE: minimum mm movement before sending a new command; tune to balance
+# responsiveness vs. jitter from hand tremor. Start high (15–20) then lower.
+MOVE_THRESHOLD_MM = 10
+
 def follow_loop():
     print("Follow mode started")
     last_x, last_y = None, None
-    MOVE_THRESHOLD_MM = 10   # only move if target shifted more than this, NEED TUNING
- 
+
     while controller.is_in(State.FOLLOW):
- 
         with result_lock:
             result = LATEST_RESULT
- 
-        # Only act on pointing gestures in follow mode
+
         if result is None or result.command != "MOVE_DIRECTED" or result.landmarks is None:
             time.sleep(0.1)
             continue
- 
+
         lm = result.landmarks[8]
-        u  = int(lm.x * 640)
-        v  = int(lm.y * 480)
- 
+        with frame_lock:
+            w, h = FRAME_W, FRAME_H
+        u = int(lm.x * w)
+        v = int(lm.y * h)
+
         coords = pixel_to_mm(u, v)
         if coords is None:
             time.sleep(0.1)
             continue
- 
+
         x_mm, y_mm = coords
- 
-        # Only send a new command if the hand has moved enough, avoids jitter
+
         if last_x is not None:
             dist = ((x_mm - last_x)**2 + (y_mm - last_y)**2) ** 0.5
             if dist < MOVE_THRESHOLD_MM:
                 time.sleep(0.1)
                 continue
- 
-        last_x, last_y = x_mm, y_mm
- 
-        # Move the arm, reuse execute_move but only if not already busy
-        if not ARM_BUSY:
-            threading.Thread(target=execute_move, args=(result,), daemon=True).start()
- 
-        time.sleep(0.1)
- 
-    print("Follow mode ended")
- 
- 
 
-# Command Dispatcher
-# Decides what to do based on current state and incoming command, transitions happen here
+        last_x, last_y = x_mm, y_mm
+
+        with busy_lock:
+            arm_busy = ARM_BUSY
+        if not arm_busy:
+            threading.Thread(target=execute_move, args=(result,), daemon=True).start()
+
+        time.sleep(0.1)
+
+    print("Follow mode ended")
+
+
+# ── Command dispatcher ─────────────────────────────────────────────────────────
+
 def dispatcher_loop():
     print("Dispatcher running")
- 
+
     while controller.running:
- 
         try:
-            # Block for up to 0.5s waiting for a command
-            # Timeout lets the loop check controller.running periodically
             cmd, payload = command_queue.get(timeout=0.5)
         except queue.Empty:
             continue
- 
-        print(f"Command received: {cmd}")
- 
+
+        print(f"[dispatch] {cmd}")
+
         if cmd == "MOVE_DIRECTED":
             if controller.is_in(State.READY):
-                # Run in a separate thread so dispatcher stays responsive
                 threading.Thread(target=execute_move, args=(payload,), daemon=True).start()
             else:
-                print(f"Ignoring MOVE, state is {controller.state.value}")
- 
+                print(f"  ignoring MOVE — state is {controller.state.value}")
+
         elif cmd == "FOLLOW":
             if controller.is_in(State.READY):
                 controller.transition(State.FOLLOW)
-                # follow_loop runs in its own thread and stops when state changes
                 threading.Thread(target=follow_loop, daemon=True).start()
- 
+
         elif cmd == "STOP_FOLLOW":
             if controller.is_in(State.FOLLOW):
                 controller.transition(State.READY)
- 
+
         elif cmd == "HOLD":
-            # Freeze the arm in place, stop accepting move commands
             if not controller.is_in(State.SLEEP):
                 controller.transition(State.HOLD)
- 
+
         elif cmd == "RELEASE":
             if controller.is_in(State.HOLD):
                 controller.transition(State.READY)
- 
+
         elif cmd == "RECORD":
             if controller.is_in(State.READY):
                 controller.transition(State.RECORD)
-                print("Recording started, implement record_loop here")
-                # code here! lol
- 
+                print("  record_loop not yet implemented — TODO")
+                # TODO: launch record_loop thread here
+
         elif cmd == "STOP_RECORD":
             if controller.is_in(State.RECORD):
                 controller.transition(State.READY)
-                print("Recording stopped")
- 
+                print("  recording stopped")
+
         elif cmd == "SLEEP":
             controller.stop()
- 
+
         elif cmd == "WAKE":
             if controller.is_in(State.SLEEP):
                 controller.start()
- 
+
         elif cmd == "HOME":
-            print("Sending home command to Arduino")
+            print("  homing...")
             try:
                 home()
             except Exception as e:
-                print(f"Failed: {e}")
+                print(f"  home failed: {e}")
 
         elif cmd == "START_CONVERSATION":
             if controller.is_in(State.READY):
                 controller.transition(State.CONVERSATION)
             else:
-                print(f"Ignoring START_CONVERSATION, state is {controller.state.value}")
+                print(f"  ignoring START_CONVERSATION — state is {controller.state.value}")
 
         elif cmd == "END_CONVERSATION":
             if controller.is_in(State.CONVERSATION):
@@ -417,38 +486,37 @@ def dispatcher_loop():
 
         elif cmd == "ASK_AI":
             if not payload:
-                print("[ai] empty payload, skipping")
-            elif AI_BUSY:
-                print(f"[ai] busy, dropping '{payload}'")
+                print("  [ai] empty payload, skipping")
             else:
-                threading.Thread(target=_run_ai, args=(payload,), daemon=True).start()
+                with ai_busy_lock:
+                    busy = AI_BUSY
+                if busy:
+                    print(f"  [ai] busy, dropping '{payload}'")
+                else:
+                    threading.Thread(target=_run_ai, args=(payload,), daemon=True).start()
 
         elif cmd == "RESET_AI":
             if assistant is not None:
                 assistant.reset()
-                print("[ai] conversation memory cleared")
+                print("  [ai] conversation memory cleared")
 
         else:
-            print(f"Unknown command: {cmd}")
- 
- 
-# overlays on camera feed
+            print(f"  unknown command: {cmd}")
+
+
+# ── Display (must run on main thread) ─────────────────────────────────────────
+
 def display_loop():
     while controller.running:
- 
         with frame_lock:
-            if LATEST_FRAME is None:
-                frame = None
-            else:
-                LATEST_FRAME.copy()
- 
+            frame = LATEST_FRAME.copy() if LATEST_FRAME is not None else None
+
         if frame is None:
             time.sleep(0.03)
             continue
- 
+
         frame = cv2.flip(frame, 1)
- 
-        # State overlay, top left
+
         state_color = {
             State.SLEEP:        (100, 100, 100),
             State.READY:        (0,   200,   0),
@@ -457,55 +525,54 @@ def display_loop():
             State.RECORD:       (0,     0, 255),
             State.CONVERSATION: (255, 120, 200),
         }.get(controller.state, (255, 255, 255))
- 
+
         cv2.rectangle(frame, (0, 0), (200, 36), (0, 0, 0), -1)
         cv2.putText(frame, f"STATE: {controller.state.value.upper()}",
                     (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
- 
-        # Arm busy indicator
-        if ARM_BUSY:
+
+        with busy_lock:
+            arm_busy = ARM_BUSY
+        if arm_busy:
             cv2.putText(frame, "MOVING", (frame.shape[1] - 100, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 120, 255), 2)
- 
-        # Latest gesture
+
         with result_lock:
             result = LATEST_RESULT
- 
+
         if result is not None and result.gesture_name != "---":
             cv2.putText(frame, result.gesture_name,
                         (8, frame.shape[0] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
- 
+
         cv2.imshow("Arm Controller", frame)
- 
-        # Press Q to quit
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            command_queue.put(("SLEEP", None))
+            controller.stop()   # signals capture_loop + inference_loop to exit too
             break
- 
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("ARM CONTROLLER FOR ARIEL, STARKHACKS 2026")
- 
-    # 1. Load matrix, connect hardware, transition to READY
+
     startup()
- 
-    # 2. Open camera
+
+    # CALIBRATE: camera index — try 0 or 1 if this doesn't open
     cap = cv2.VideoCapture(2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     if not cap.isOpened():
-        print("Camera not found")
+        print("Camera not found at index 2")
         sys.exit(1)
- 
-    # 3. Initialize gesture recognizer
-    recognizer = NPUGestureRecognizer("models/old/mediapipe_hand_gesture-canned_gesture_classifier-w8a8.tflite")
- 
-    # 4. Send arm to home position
+
+    recognizer = NPUGestureRecognizer(
+        "models/old/mediapipe_hand_gesture-canned_gesture_classifier-w8a8.tflite"
+    )
+
     print("Homing arm...")
     command_queue.put(("HOME", None))
- 
-    # 5. Launch background threads
+
     threading.Thread(target=capture_loop,    args=(cap,),        daemon=True).start()
     threading.Thread(target=inference_loop,  args=(recognizer,), daemon=True).start()
     threading.Thread(target=dispatcher_loop,                     daemon=True).start()
@@ -514,19 +581,16 @@ if __name__ == "__main__":
         args=(_voice_on_text, lambda: not controller.running),
         daemon=True,
     ).start()
- 
+
     print("All threads started")
     print("Press Q in the camera window to quit\n")
- 
-    # 6. Display loop runs on main thread (OpenCV needs this)
+
     try:
         display_loop()
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt received")
-    finally:
-        # Clean shutdown, stop state machine, release camera
+        print("\nKeyboard interrupt")
         controller.stop()
+    finally:
         cap.release()
         cv2.destroyAllWindows()
         print("Shutdown complete")
-
