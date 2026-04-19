@@ -103,7 +103,7 @@ def resolve_command(label: str, landmarks, confidence: float) -> GestureResult:
     return GestureResult(label, "NONE", confidence, landmarks, 1)
 
 
-def classify_gesture(pts: list[tuple]) -> str:
+def classify_gesture(pts: list) -> str:
     """
     Heuristic gesture name from raw (px, py) landmark list.
     Used when model output is landmarks-only (no class head).

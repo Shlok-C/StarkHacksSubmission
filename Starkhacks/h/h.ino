@@ -1,8 +1,5 @@
 #include <AccelStepper.h>
 
-
-
-
 // ======================================================
 // ENCODER PINS
 // ======================================================
@@ -10,15 +7,11 @@ const int ENC1_CLK = 22;
 const int ENC1_DT  = 23;
 const int ENC1_SW  = 24;   // button used to request calibration
 
-
 const int ENC2_CLK = 27;
 const int ENC2_DT  = 26;
 
-
 const int ENC3_CLK = 28;
 const int ENC3_DT  = 29;
-
-
 
 
 // ======================================================
@@ -29,16 +22,12 @@ const int LIM2_PIN = 37;   // L298N home switch
 const int LIM3_PIN = 41;   // just reported for now
 
 
-
-
 // ======================================================
 // TMC2208 PINS
 // ======================================================
 const int TMC_STEP_PIN = 2;
 const int TMC_DIR_PIN  = 3;
 const int TMC_EN_PIN   = 4;
-
-
 
 
 // ======================================================
@@ -52,8 +41,6 @@ const int L298_IN3 = 33;
 const int L298_IN4 = 34;
 
 
-
-
 // ======================================================
 // ANGLE TRACKING CONSTANTS
 // ======================================================
@@ -65,12 +52,9 @@ const int L298_IN4 = 34;
 //   16x -> 3200   (MS1=HIGH, MS2=HIGH)
 const float TMC_STEPS_PER_REV = 1600.0;
 
-
 // L298N half-step: standard 200-step motor * 2 = 400
 // If using 28BYJ-48 with gearbox, use 4096.0 instead
 const float L298_HALFSTEPS_PER_REV = 400.0;
-
-
 
 
 // ======================================================
@@ -82,8 +66,6 @@ const float L298_HALFSTEPS_PER_REV = 400.0;
 int control_mode = 0;
 
 
-
-
 // ======================================================
 // STATE MACHINE
 // ======================================================
@@ -93,10 +75,7 @@ enum SystemState {
   STATE_CALIBRATING
 };
 
-
 SystemState systemState = STATE_NORMAL;
-
-
 
 
 // ======================================================
@@ -106,11 +85,8 @@ long enc1Count = 0;
 long enc2Count = 0;
 long enc3Count = 0;
 
-
 int lastEnc2CLK;
 int lastEnc3CLK;
-
-
 
 
 // ======================================================
@@ -122,8 +98,6 @@ unsigned long lastDebounceTime = 0;
 const unsigned long DEBOUNCE_DELAY = 50;
 
 
-
-
 // ======================================================
 // STREAMING TIMING
 // ======================================================
@@ -131,13 +105,10 @@ unsigned long lastPrintTime = 0;
 const unsigned long PRINT_INTERVAL_MS = 20;
 
 
-
-
 // ======================================================
 // SERIAL INPUT BUFFER
 // ======================================================
 String rxLine = "";
-
 
 // ======================================================
 // PI POSITION CONTROL
@@ -149,20 +120,16 @@ long tmcTargetFromPi  = 0;
 long l298TargetFromPi = 0;
 
 
-
-
 // ======================================================
 // TMC2208 VIA ACCELSTEPPER
 // ======================================================
 AccelStepper tmcStepper(AccelStepper::DRIVER, TMC_STEP_PIN, TMC_DIR_PIN);
-
 
 // Jog tuning
 const long  TMC_STEPS_PER_CLICK = 20;
 const float TMC_MOVE_SPEED      = 1200.0;
 const float TMC_ACCEL           = 800.0;
 long tmcTargetPosition = 0;
-
 
 // Homing tuning
 const float        TMC_HOME_SPEED       = 400.0;
@@ -171,18 +138,14 @@ const unsigned long TMC_HOME_TIMEOUT_MS = 1500000;
 const bool         TMC_HOME_DIR_POSITIVE = true;
 
 
-
-
 // ======================================================
 // L298N TUNING
 // ======================================================
 const int L298_PWM_VALUE = 255;
 
-
 // Jog tuning
 const int L298_JOG_STEPS_PER_CLICK = 30;
 const int L298_JOG_STEP_DELAY_MS   = 6;
-
 
 // Homing tuning
 const int          L298_HOME_STEP_DELAY_MS  = 6;
@@ -190,11 +153,9 @@ const long         L298_BACKOFF_HALFSTEPS   = 1200;
 const unsigned long L298_HOME_TIMEOUT_MS    = 15000;
 const bool         L298_HOME_DIR_FORWARD    = true;
 
-
 // L298 half-step sequence
 int  l298SeqIndex = 0;
 long l298Position = 0;
-
 
 const uint8_t L298_SEQ[8][4] = {
   {1,0,0,0},
@@ -208,8 +169,6 @@ const uint8_t L298_SEQ[8][4] = {
 };
 
 
-
-
 // ======================================================
 // FORWARD DECLARATIONS
 // ======================================================
@@ -221,7 +180,6 @@ void handleIncomingSerial();
 void sendStatusLine();
 bool limitPressed(int pin);
 
-
 void runCalibrationSequence();
 bool homeTMCAxis();
 bool homeL298Axis();
@@ -229,18 +187,14 @@ bool homeL298Axis();
 float degToTMCSteps(float deg);
 float degToL298Steps(float deg);
 
-
 void enableL298Motor();
 void disableL298Motor();
 void setL298Outputs(int a, int b, int c, int d);
 void stepL298(bool forward, int steps, int stepDelayMs);
 void streamDuringCalibration();
 
-
 float getTMCAngle();
 float getL298Angle();
-
-
 
 
 // ======================================================
@@ -249,40 +203,32 @@ float getL298Angle();
 void setup() {
   Serial.begin(115200);
 
-
   // Encoders
   pinMode(ENC1_CLK, INPUT_PULLUP);
   pinMode(ENC1_DT,  INPUT_PULLUP);
   pinMode(ENC1_SW,  INPUT_PULLUP);
 
-
   pinMode(ENC2_CLK, INPUT_PULLUP);
   pinMode(ENC2_DT,  INPUT_PULLUP);
-
 
   pinMode(ENC3_CLK, INPUT_PULLUP);
   pinMode(ENC3_DT,  INPUT_PULLUP);
 
-
   lastEnc2CLK = digitalRead(ENC2_CLK);
   lastEnc3CLK = digitalRead(ENC3_CLK);
-
 
   // Limit switches
   pinMode(LIM1_PIN, INPUT_PULLUP);
   pinMode(LIM2_PIN, INPUT_PULLUP);
   pinMode(LIM3_PIN, INPUT_PULLUP);
 
-
   // TMC2208
   pinMode(TMC_EN_PIN, OUTPUT);
   digitalWrite(TMC_EN_PIN, LOW);   // LOW = enabled on TMC2208
 
-
   tmcStepper.setMaxSpeed(TMC_MOVE_SPEED);
   tmcStepper.setAcceleration(TMC_ACCEL);
   tmcStepper.setCurrentPosition(0);
-
 
   // L298N
   pinMode(L298_ENA, OUTPUT);
@@ -292,11 +238,8 @@ void setup() {
   pinMode(L298_IN3, OUTPUT);
   pinMode(L298_IN4, OUTPUT);
 
-
   disableL298Motor();
 }
-
-
 
 
 // ======================================================
@@ -305,12 +248,10 @@ void setup() {
 void loop() {
   handleIncomingSerial();
 
-
   // Always update encoder counts
   readEncoder1();
   readEncoder2();
   readEncoder3();
-
 
   // Default state: manual jog or Pi position control
   if (systemState == STATE_NORMAL) {
@@ -321,7 +262,6 @@ void loop() {
     tmcStepper.run();  // always run — moveTo() was already set by command handler when piControlActive
   }
 
-
   // Normal streaming or waiting for Pi ack
   if (systemState == STATE_NORMAL || systemState == STATE_WAITING_FOR_ACK) {
     if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
@@ -330,7 +270,6 @@ void loop() {
     }
   }
 
-
   // Once Pi sends back "2", start homing both motors
   if (systemState == STATE_CALIBRATING) {
     runCalibrationSequence();
@@ -338,8 +277,6 @@ void loop() {
     control_mode = 0;
   }
 }
-
-
 
 
 // ======================================================
@@ -353,12 +290,9 @@ float getTMCAngle() {
   return ((float)tmcStepper.currentPosition() / TMC_STEPS_PER_REV) * 360.0;
 }
 
-
 float getL298Angle() {
   return ((float)l298Position / L298_HALFSTEPS_PER_REV) * 360.0;
 }
-
-
 
 
 // ======================================================
@@ -369,7 +303,6 @@ void sendStatusLine() {
   int lim1State = digitalRead(LIM1_PIN);
   int lim2State = digitalRead(LIM2_PIN);
   int lim3State = digitalRead(LIM3_PIN);
-
 
   Serial.print(control_mode);      Serial.print(",");
   Serial.print(enc1Count);         Serial.print(",");
@@ -383,8 +316,6 @@ void sendStatusLine() {
 }
 
 
-
-
 // ======================================================
 // HANDLE SERIAL COMMANDS FROM PI
 // Expected:
@@ -394,11 +325,9 @@ void handleIncomingSerial() {
   while (Serial.available() > 0) {
     char c = Serial.read();
 
-
     if (c == '\n' || c == '\r') {
       if (rxLine.length() > 0) {
         rxLine.trim();
-
 
         if (rxLine == "2" && systemState == STATE_WAITING_FOR_ACK) {
           // Encoder button homing ack from Pi
@@ -444,8 +373,6 @@ void handleIncomingSerial() {
 }
 
 
-
-
 // ======================================================
 // ENC1 BUTTON
 // Press once -> request homing
@@ -453,16 +380,13 @@ void handleIncomingSerial() {
 void handleEnc1Button() {
   int reading = digitalRead(ENC1_SW);
 
-
   if (reading != lastButtonState) {
     lastDebounceTime = millis();
   }
 
-
   if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
     if (reading != stableButtonState) {
       stableButtonState = reading;
-
 
       // Detect press (HIGH -> LOW)
       if (stableButtonState == LOW) {
@@ -472,11 +396,8 @@ void handleEnc1Button() {
     }
   }
 
-
   lastButtonState = reading;
 }
-
-
 
 
 // ======================================================
@@ -485,11 +406,9 @@ void handleEnc1Button() {
 void readEncoder1() {
   static int lastState = 0;
 
-
   int clk = digitalRead(ENC1_CLK);
   int dt  = digitalRead(ENC1_DT);
   int currentState = (clk << 1) | dt;
-
 
   if (currentState != lastState) {
     // Valid CW transitions: 00->01, 01->11, 11->10, 10->00
@@ -513,15 +432,12 @@ void readEncoder1() {
       }
     }
 
-
     lastState = currentState;
   }
 }
 
-
 void readEncoder2() {
   int currentCLK = digitalRead(ENC2_CLK);
-
 
   if (currentCLK != lastEnc2CLK && currentCLK == HIGH) {
     if (digitalRead(ENC2_DT) != currentCLK) {
@@ -531,19 +447,15 @@ void readEncoder2() {
     }
   }
 
-
   lastEnc2CLK = currentCLK;
 }
-
 
 void readEncoder3() {
   int currentCLK = digitalRead(ENC3_CLK);
 
-
   if (currentCLK != lastEnc3CLK && currentCLK == HIGH) {
     if (digitalRead(ENC3_DT) != currentCLK) {
       enc3Count++;
-
 
       if (systemState == STATE_NORMAL) {
         enableL298Motor();
@@ -552,7 +464,6 @@ void readEncoder3() {
     } else {
       enc3Count--;
 
-
       if (systemState == STATE_NORMAL) {
         enableL298Motor();
         stepL298(false, L298_JOG_STEPS_PER_CLICK, L298_JOG_STEP_DELAY_MS);
@@ -560,11 +471,8 @@ void readEncoder3() {
     }
   }
 
-
   lastEnc3CLK = currentCLK;
 }
-
-
 
 
 // ======================================================
@@ -576,8 +484,6 @@ bool limitPressed(int pin) {
 }
 
 
-
-
 // ======================================================
 // CALIBRATION MASTER ROUTINE
 // While calibrating, Mega continuously sends control_mode=2.
@@ -587,25 +493,19 @@ bool limitPressed(int pin) {
 void runCalibrationSequence() {
   control_mode = 2;
 
-
   bool tmcOk  = homeTMCAxis();
   bool l298Ok = homeL298Axis();
 
-
   disableL298Motor();
-
 
   // Zero both position trackers at the backed-off home position
   tmcStepper.setCurrentPosition(0);
   tmcTargetPosition = 0;
   l298Position      = 0;
 
-
   (void)tmcOk;
   (void)l298Ok;
 }
-
-
 
 
 // ======================================================
@@ -617,28 +517,23 @@ void runCalibrationSequence() {
 bool homeTMCAxis() {
   unsigned long startTime = millis();
 
-
   if (TMC_HOME_DIR_POSITIVE) {
     tmcStepper.setSpeed(TMC_HOME_SPEED);
   } else {
     tmcStepper.setSpeed(-TMC_HOME_SPEED);
   }
 
-
   while (!limitPressed(LIM1_PIN)) {
     tmcStepper.runSpeed();
     streamDuringCalibration();
-
 
     if (millis() - startTime > TMC_HOME_TIMEOUT_MS) {
       return false;
     }
   }
 
-
   long currentPos = tmcStepper.currentPosition();
   long targetPos;
-
 
   if (TMC_HOME_DIR_POSITIVE) {
     targetPos = currentPos - TMC_BACKOFF_STEPS;
@@ -646,19 +541,15 @@ bool homeTMCAxis() {
     targetPos = currentPos + TMC_BACKOFF_STEPS;
   }
 
-
   tmcStepper.moveTo(targetPos);
   while (tmcStepper.distanceToGo() != 0) {
     tmcStepper.run();
     streamDuringCalibration();
   }
 
-
   tmcTargetPosition = tmcStepper.currentPosition();
   return true;
 }
-
-
 
 
 // ======================================================
@@ -670,26 +561,20 @@ bool homeTMCAxis() {
 bool homeL298Axis() {
   unsigned long startTime = millis();
 
-
   enableL298Motor();
-
 
   while (!limitPressed(LIM3_PIN)) {
     stepL298(L298_HOME_DIR_FORWARD, 1, L298_HOME_STEP_DELAY_MS);
     streamDuringCalibration();
-
 
     if (millis() - startTime > L298_HOME_TIMEOUT_MS) {
       return false;
     }
   }
 
-
   stepL298(!L298_HOME_DIR_FORWARD, L298_BACKOFF_HALFSTEPS, L298_HOME_STEP_DELAY_MS);
   return true;
 }
-
-
 
 
 // ======================================================
@@ -703,11 +588,8 @@ void streamDuringCalibration() {
     sendStatusLine();
   }
 
-
   handleIncomingSerial();
 }
-
-
 
 
 // ======================================================
@@ -718,11 +600,9 @@ void enableL298Motor() {
   analogWrite(L298_ENB, L298_PWM_VALUE);
 }
 
-
 void disableL298Motor() {
   analogWrite(L298_ENA, 0);
   analogWrite(L298_ENB, 0);
-
 
   digitalWrite(L298_IN1, LOW);
   digitalWrite(L298_IN2, LOW);
@@ -730,14 +610,12 @@ void disableL298Motor() {
   digitalWrite(L298_IN4, LOW);
 }
 
-
 void setL298Outputs(int a, int b, int c, int d) {
   digitalWrite(L298_IN1, a);
   digitalWrite(L298_IN2, b);
   digitalWrite(L298_IN3, c);
   digitalWrite(L298_IN4, d);
 }
-
 
 void stepL298(bool forward, int steps, int stepDelayMs) {
   for (int i = 0; i < steps; i++) {
@@ -751,7 +629,6 @@ void stepL298(bool forward, int steps, int stepDelayMs) {
       l298Position--;
     }
 
-
     setL298Outputs(
       L298_SEQ[l298SeqIndex][0],
       L298_SEQ[l298SeqIndex][1],
@@ -759,7 +636,17 @@ void stepL298(bool forward, int steps, int stepDelayMs) {
       L298_SEQ[l298SeqIndex][3]
     );
 
-
     delay(stepDelayMs);
   }
+}
+
+// ======================================================
+// DEGREE TO STEP CONVERSIONS
+// ======================================================
+float degToTMCSteps(float deg) {
+  return (deg / 360.0) * TMC_STEPS_PER_REV;
+}
+
+float degToL298Steps(float deg) {
+  return (deg / 360.0) * L298_HALFSTEPS_PER_REV;
 }

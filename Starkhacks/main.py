@@ -12,7 +12,7 @@ import lcm
 
 # new_ik.py lives two directories above this file (project root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from new_ik import move_to
+from StarkHacksSubmission.new_ik import move_to
 from cv_lib.gesture_recognizer import NPUGestureRecognizer, GestureResult
 from cv_lib.voice_recognition import listen_transcripts, take_picture
 from mytypes.arm_angles import arm_angles as ArmAngles
@@ -27,27 +27,13 @@ FRAME_W           = 640   # updated from first real frame
 FRAME_H           = 480   # CALIBRATE: match actual camera resolution
 assistant         = None
 
-# CALIBRATE: If True, horizontally mirror the camera frame before both
-# recognition AND display. Homography MUST have been calibrated on the view
-# that matches this setting (i.e. if you clicked corners on a mirrored preview,
-# keep this True; otherwise set False to stop the arm from moving in the
-# opposite X direction from what the user points to).
-FLIP_FRAME = True
-
-# Minimum interval (seconds) between send_angles() writes. AVR Mega's UART RX
-# buffer is 64 B; follow_loop runs at 10 Hz so the buffer can fill faster than
-# the stepper code consumes it. Drop extra writes instead of piling them up.
-SEND_ANGLES_MIN_INTERVAL = 0.05
-_last_send_angles_ts = 0.0
-
 # Thread locks
 frame_lock    = threading.Lock()
 result_lock   = threading.Lock()
 busy_lock     = threading.Lock()
 ai_busy_lock  = threading.Lock()
-serial_lock   = threading.Lock()   # serialises send_angles/home writes
 
-command_queue = queue.Queue(maxsize=32)   # bounded so a hung dispatcher can't eat memory
+command_queue = queue.Queue()
 
 # Serial connection to Arduino Mega (set in connect())
 _ser = None
@@ -77,17 +63,7 @@ def connect():
     device = _find_mega()
     if device is None:
         raise RuntimeError("No Arduino Mega found on any USB port")
-    try:
-        _ser = serial.Serial(device, 115200, timeout=1)
-    except serial.SerialException as e:
-        # On Linux, opening an in-use serial port raises with errno EBUSY
-        # (or "could not open port"). Give a clear hint — most commonly this
-        # collides with odrive_control.py, which also exclusively opens the Mega.
-        raise RuntimeError(
-            f"[serial] could not open {device}: {e}. "
-            "Is odrive_control.py (or another process) holding the port? "
-            "Only one process can own the Mega's serial at a time."
-        ) from e
+    _ser = serial.Serial(device, 115200, timeout=1)
     time.sleep(2)                    # wait for Arduino bootloader reset
     _ser.reset_input_buffer()
     print(f"[serial] connected: {device}")
@@ -99,24 +75,17 @@ def send_angles(th_b, th_e):
     Protocol (ASCII, newline-terminated):
         A,<base_deg>,<elbow_deg>\\n
 
-    Rate-limited (SEND_ANGLES_MIN_INTERVAL) to avoid overflowing the AVR UART
-    buffer at follow_loop's 10 Hz cadence. Serial exceptions are swallowed
-    with a warning so a USB glitch doesn't kill the move thread.
+    Arduino drives:
+      TMC2208 stepper → base  (th_b)
+      L298N stepper   → elbow (th_e)
+    Shoulder → ODrive via LCM only, not here.
+    # WRIST: pass th_w here and append to line once wrist hardware is ready.
     """
-    global _last_send_angles_ts
     if _ser is None:
         print("[serial] not connected — skipping send_angles")
         return
-    now = time.monotonic()
-    if now - _last_send_angles_ts < SEND_ANGLES_MIN_INTERVAL:
-        return  # drop — the stepper can't keep up anyway
     line = f"A,{th_b:.2f},{th_e:.2f}\n"
-    with serial_lock:
-        try:
-            _ser.write(line.encode())
-            _last_send_angles_ts = now
-        except serial.SerialException as e:
-            print(f"[serial] send_angles failed: {e}")
+    _ser.write(line.encode())
 
 
 def home():
@@ -124,26 +93,18 @@ def home():
     if _ser is None:
         print("[serial] not connected — skipping home")
         return
-    with serial_lock:
-        try:
-            _ser.write(b"H\n")
-        except serial.SerialException as e:
-            print(f"[serial] home failed: {e}")
+    _ser.write(b"H\n")
 
 
 # ── LCM publisher ──────────────────────────────────────────────────────────────
 
 def _publish_lcm(th_b, th_s, th_e):
-    """Publish angles on TARGET_ANGLE so odrive_control.py drives the shoulder.
-    Errors are swallowed — LCM failures shouldn't take down the move thread."""
-    try:
-        msg          = ArmAngles()
-        msg.base     = float(th_b)
-        msg.shoulder = float(th_s)
-        msg.elbow    = float(th_e)
-        lc.publish("TARGET_ANGLE", msg.encode())
-    except Exception as e:
-        print(f"[lcm] publish failed: {e}")
+    """Publish angles on TARGET_ANGLE so odrive_control.py drives the shoulder."""
+    msg          = ArmAngles()
+    msg.base     = float(th_b)
+    msg.shoulder = float(th_s)
+    msg.elbow    = float(th_e)
+    lc.publish("TARGET_ANGLE", msg.encode())
 
 
 # ── State machine ──────────────────────────────────────────────────────────────
@@ -197,17 +158,15 @@ VOICE_CMD_MAP = [
     (("take picture", "cheese", "snap"),            "TAKE_PICTURE", None),
 ]
 
-# Keep wake/exit phrases apostrophe-robust — Google Speech drops apostrophes
-# ~half the time ("you're" → "youre"). Stick to plain words or include both forms.
-WAKE_PHRASES = ("hey ariel", "okay ariel")
-EXIT_PHRASES = ("stop talking", "thanks ariel", "goodbye", "that's all", "thats all")
+WAKE_PHRASES = ("hey ariel", "you're crazy")
+EXIT_PHRASES = ("done", "stop talking", "thanks ariel", "goodbye", "shut up", "i'ma kill you")
 
 
 def _run_ai(question: str):
-    """Spawned per ASK_AI. Multi-turn WorkbenchAssistant retains history.
-    Assumes AI_BUSY has already been set True by the dispatcher (see below)
-    to avoid a check/spawn TOCTOU race — this function only clears it."""
-    global assistant, AI_BUSY
+    """Spawned per ASK_AI. Multi-turn WorkbenchAssistant retains history."""
+    global AI_BUSY, assistant
+    with ai_busy_lock:
+        AI_BUSY = True
     try:
         if assistant is None:
             from cv_lib import WorkbenchAssistant
@@ -287,13 +246,11 @@ def _voice_on_text(text: str):
 
 def startup():
     global HOMOGRAPHY_MATRIX
-    # Resolve relative to main.py's location so cwd doesn't matter.
-    matrix_path = os.path.join(os.path.dirname(__file__), "homography_matrix.npy")
     try:
-        HOMOGRAPHY_MATRIX = np.load(matrix_path)
-        print(f"Loaded homography matrix from {matrix_path}")
+        HOMOGRAPHY_MATRIX = np.load("homography_matrix.npy")
+        print("Loaded homography matrix")
     except FileNotFoundError:
-        print(f"No homography matrix at {matrix_path} — run calibration first")
+        print("No homography matrix found — run calibration first")
         sys.exit(1)
 
     try:
@@ -339,26 +296,21 @@ def inference_loop(recognizer):
             time.sleep(0.01)
             continue
 
-        if FLIP_FRAME:
-            frame = cv2.flip(frame, 1)
+        frame  = cv2.flip(frame, 1)
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = recognizer.process(rgb)
 
         with result_lock:
             LATEST_RESULT = result
 
-        # Only push MOVE_DIRECTED when (a) we're in a state that would actually
-        # act on it (READY — FOLLOW has its own loop) AND (b) the arm isn't
-        # already moving. Prevents the dispatcher from logging "ignoring MOVE"
-        # every frame in HOLD/SLEEP/CONVERSATION states.
-        if result.command == "MOVE_DIRECTED" and controller.is_in(State.READY):
+        if result.command == "MOVE_DIRECTED":
             with busy_lock:
                 arm_busy = ARM_BUSY
             if not arm_busy:
                 try:
                     command_queue.put_nowait(("MOVE_DIRECTED", result))
                 except queue.Full:
-                    pass   # dispatcher backed up — drop this frame's command
+                    pass
 
 
 # ── Move execution: pixel → mm → IK → LCM + serial ───────────────────────────
@@ -464,7 +416,6 @@ def follow_loop():
 # ── Command dispatcher ─────────────────────────────────────────────────────────
 
 def dispatcher_loop():
-    global AI_BUSY
     print("Dispatcher running")
 
     while controller.running:
@@ -537,17 +488,11 @@ def dispatcher_loop():
             if not payload:
                 print("  [ai] empty payload, skipping")
             else:
-                # Atomic check-and-set under the lock so two back-to-back
-                # ASK_AI cmds can't both spawn _run_ai. The spawned thread
-                # is responsible only for clearing AI_BUSY on exit.
                 with ai_busy_lock:
-                    if AI_BUSY:
-                        print(f"  [ai] busy, dropping '{payload}'")
-                        spawn = False
-                    else:
-                        AI_BUSY = True
-                        spawn = True
-                if spawn:
+                    busy = AI_BUSY
+                if busy:
+                    print(f"  [ai] busy, dropping '{payload}'")
+                else:
                     threading.Thread(target=_run_ai, args=(payload,), daemon=True).start()
 
         elif cmd == "RESET_AI":
@@ -570,8 +515,7 @@ def display_loop():
             time.sleep(0.03)
             continue
 
-        if FLIP_FRAME:
-            frame = cv2.flip(frame, 1)
+        frame = cv2.flip(frame, 1)
 
         state_color = {
             State.SLEEP:        (100, 100, 100),
